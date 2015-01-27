@@ -48,14 +48,6 @@ options:
     required: false
     default: null
     aliases: []
-  volume_type:
-    description:
-      - Type of EBS volume; standard (magnetic), gp2 (SSD), io1 (Provisioned IOPS). "Standard" is the old EBS default
-        and continues to remain the Ansible default for backwards compatibility. 
-    required: false
-    default: standard
-    aliases: []
-    version_added: "1.9"
   iops:
     description:
       - the provisioned IOPs you want to associate with this volume (integer).
@@ -113,31 +105,36 @@ extends_documentation_fragment: aws
 
 EXAMPLES = '''
 # Simple attachment action
-- ec2_vol: 
+- local_action: 
+    module: ec2_vol 
     instance: XXXXXX 
     volume_size: 5 
     device_name: sdd
 
 # Example using custom iops params   
-- ec2_vol:
+- local_action: 
+    module: ec2_vol 
     instance: XXXXXX 
     volume_size: 5 
     iops: 200
     device_name: sdd
 
 # Example using snapshot id
-- ec2_vol:
+- local_action:
+    module: ec2_vol
     instance: XXXXXX
     snapshot: "{{ snapshot }}"
 
 # Playbook example combined with instance launch 
-- ec2:
+- local_action: 
+    module: ec2 
     keypair: "{{ keypair }}"
     image: "{{ image }}"
     wait: yes 
     count: 3
     register: ec2
-- ec2_vol:
+- local_action: 
+    module: ec2_vol 
     instance: "{{ item.id }} " 
     volume_size: 5
     with_items: ec2.instances
@@ -147,7 +144,8 @@ EXAMPLES = '''
 #   * Nothing will happen if the volume is already attached.
 #   * Volume must exist in the same zone.
 
-- ec2:
+- local_action: 
+    module: ec2 
     keypair: "{{ keypair }}"
     image: "{{ image }}"
     zone: YYYYYY
@@ -156,7 +154,8 @@ EXAMPLES = '''
     count: 1
     register: ec2
 
-- ec2_vol:
+- local_action: 
+    module: ec2_vol 
     instance: "{{ item.id }}" 
     name: my_existing_volume_Name_tag
     device_name: /dev/xvdf
@@ -164,27 +163,22 @@ EXAMPLES = '''
     register: ec2_vol
 
 # Remove a volume
-- ec2_vol:
+- local_action:
+    module: ec2_vol
     id: vol-XXXXXXXX
     state: absent
 
-# Detach a volume
-- ec2_vol:
-    id: vol-XXXXXXXX
-    instance: None
-
 # List volumes for an instance
-- ec2_vol:
+- local_action:
+    module: ec2_vol
     instance: i-XXXXXX
     state: list
-    
-# Create new volume using SSD storage
-- ec2_vol:
-    instance: XXXXXX
-    volume_size: 50
-    volume_type: gp2
-    device_name: /dev/xvdf
 '''
+
+# Note: this module needs to be made idempotent. Possible solution is to use resource tags with the volumes.
+# if state=present and it doesn't exist, create, tag and attach. 
+# Check for state by looking for volume attachment with tag (and against block device mapping?).
+# Would personally like to revisit this in May when Eucalyptus also has tagging support (3.3).
 
 import sys
 import time
@@ -259,24 +253,22 @@ def create_volume(module, ec2, zone):
     iops = module.params.get('iops')
     encrypted = module.params.get('encrypted')
     volume_size = module.params.get('volume_size')
-    volume_type = module.params.get('volume_type')
     snapshot = module.params.get('snapshot')
+    volume_type = module.params.get('volume_type')
+
     # If custom iops is defined we use volume_type "io1" rather than the default of "standard"
     if iops:
         volume_type = 'io1'
 
-    if instance == 'None' or instance == '':
-        instance = None
-
     # If no instance supplied, try volume creation based on module parameters.
     if name or id:
+        if not instance:
+            module.fail_json(msg = "If name or id is specified, instance must also be specified")
         if iops or volume_size:
             module.fail_json(msg = "Parameters are not compatible: [id or name] and [iops or volume_size]")
 
         volume = get_volume(module, ec2)
         if volume.attachment_state() is not None:
-            if instance is None:
-                return volume
             adata = volume.attach_data
             if adata.instance_id != instance:
                 module.fail_json(msg = "Volume %s is already attached to another instance: %s"
@@ -338,13 +330,6 @@ def attach_volume(module, ec2, volume, instance):
         except boto.exception.BotoServerError, e:
             module.fail_json(msg = "%s: %s" % (e.error_code, e.error_message))
 
-def detach_volume(module, ec2):
-    vol = get_volume(module, ec2)
-    if not vol or vol.attachment_state() is None:
-        module.exit_json(changed=False)
-    else:
-        vol.detach()
-        module.exit_json(changed=True)
 
 def main():
     argument_spec = ec2_argument_spec()
@@ -353,10 +338,10 @@ def main():
             id = dict(),
             name = dict(),
             volume_size = dict(),
-            volume_type = dict(choices=['standard', 'gp2', 'io1'], default='standard'),
             iops = dict(),
             encrypted = dict(),
             device_name = dict(),
+            volume_type = dict(choices=['gp2', 'io1', 'standard'], default='standard'),
             zone = dict(aliases=['availability_zone', 'aws_zone', 'ec2_zone']),
             snapshot = dict(),
             state = dict(choices=['absent', 'present', 'list'], default='present')
@@ -368,16 +353,13 @@ def main():
     name = module.params.get('name')
     instance = module.params.get('instance')
     volume_size = module.params.get('volume_size')
-    volume_type = module.params.get('volume_type')
     iops = module.params.get('iops')
     encrypted = module.params.get('encrypted')
     device_name = module.params.get('device_name')
     zone = module.params.get('zone')
     snapshot = module.params.get('snapshot')
     state = module.params.get('state')
-
-    if instance == 'None' or instance == '':
-        instance = None
+    volume_type = module.params.get('volume_type')    
 
     ec2 = ec2_connect(module)
 
@@ -445,9 +427,7 @@ def main():
         volume = create_volume(module, ec2, zone)
         if instance:
             attach_volume(module, ec2, volume, inst)
-        else:
-            detach_volume(module, ec2)    
-        module.exit_json(volume_id=volume.id, device=device_name, volume_type=volume.type)
+        module.exit_json(volume_id=volume.id, device=device_name)
 
 # import module snippets
 from ansible.module_utils.basic import *
